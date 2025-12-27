@@ -33,7 +33,7 @@ The system consists of three main components:
 ## Installation
 
 ```bash
-go get github.com/yourusername/my-celery
+go get github.com/caleberi/grain
 ```
 
 ### Prerequisites
