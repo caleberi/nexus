@@ -154,15 +154,17 @@ type NexusCore struct {
 	ctx        context.Context    // Context for cancellation and timeouts.
 	cancelFunc context.CancelFunc // Function to cancel the nexus-core context.
 
-	Plugins map[string]Plugin // Maps event types to their plugin implementations.
-	// pluginsMutex     sync.RWMutex                   // Synchronizes access to the Plugins map.
-	pluginSemaphores map[string]*semaphore.Weighted // Limits concurrent plugin executions per event type.
+	Plugins                      map[string]Plugin              // Maps event types to their plugin implementations.
+	pluginSemaphores             map[string]*semaphore.Weighted // Limits concurrent plugin executions per event type.
+	taskIDs                      map[string]string              // Tracks registered task IDs by delegation type.
+	maxPluginConcurrentExecution int64
 
 	Backend *machinery.Server // Machinery server for task queuing and execution.
 	Logger  zerolog.Logger    // Logger for recording nexus-core activities.
 	storage *NexusFlow        // Manages event queue and persistent storage.
 	stream  *Stream
 	wg      *sync.WaitGroup
+	mu      sync.Mutex
 }
 
 type RedisArgs struct { // Redis configuration for broker and backend.
@@ -249,6 +251,14 @@ func NewNexusCore(ctx context.Context, args NexusCoreBackendArgs) (*NexusCore, e
 		}
 	}
 
+	if args.TaskStateQueue == nil {
+		return nil, fmt.Errorf("Task queue cannot be empty")
+	}
+
+	if args.Plugins == nil {
+		args.Plugins = make(map[string]Plugin)
+	}
+
 	args.StreamCapacity = int(math.Max(float64(args.StreamCapacity), 1000.0))
 	args.MaxConcurrentPluginPerExecution = int64(math.Max(float64(args.MaxConcurrentPluginPerExecution), 1.0))
 
@@ -280,7 +290,7 @@ func NewNexusCore(ctx context.Context, args NexusCoreBackendArgs) (*NexusCore, e
 			Client:             redisClient,
 			Logger:             args.Logger,
 			LeaseTTL:           5 * time.Second,
-			OperationTimeout:   10 * time.Second,
+			OperationTimeout:   30 * time.Second,
 			DbClient:           args.MongoDbClient,
 			MaxQueueLength:     args.MaxFlowQueueLength,
 			ScanAndFixInterval: args.ScanAndFixFlowInterval,
@@ -293,14 +303,16 @@ func NewNexusCore(ctx context.Context, args NexusCoreBackendArgs) (*NexusCore, e
 	// Create orchestrator context and instance.
 	nexusCtx, cancelFunc := context.WithCancel(ctx)
 	core := &NexusCore{
-		ctx:              nexusCtx,
-		cancelFunc:       cancelFunc,
-		storage:          storageEngine,
-		Plugins:          args.Plugins,
-		Backend:          machinerySrv,
-		Logger:           args.Logger,
-		wg:               &sync.WaitGroup{},
-		pluginSemaphores: make(map[string]*semaphore.Weighted),
+		ctx:                          nexusCtx,
+		cancelFunc:                   cancelFunc,
+		storage:                      storageEngine,
+		Plugins:                      args.Plugins,
+		Backend:                      machinerySrv,
+		Logger:                       args.Logger,
+		wg:                           &sync.WaitGroup{},
+		pluginSemaphores:             make(map[string]*semaphore.Weighted),
+		taskIDs:                      make(map[string]string),
+		maxPluginConcurrentExecution: args.MaxConcurrentPluginPerExecution,
 		stream: &Stream{
 			pending:    make(chan EventDetail, args.StreamCapacity),
 			processing: make(chan EventDetail, args.StreamCapacity),
@@ -308,19 +320,107 @@ func NewNexusCore(ctx context.Context, args NexusCoreBackendArgs) (*NexusCore, e
 		},
 	}
 
-	for delegationType, plugin := range args.Plugins {
-		core.pluginSemaphores[delegationType] = semaphore.NewWeighted(args.MaxConcurrentPluginPerExecution)
-		task, err := createTaskFunction(plugin)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create task for plugin %s: %w", delegationType, err)
-		}
-		taskId := fmt.Sprintf("task-%s-v-%d", plugin.Meta().ID(), plugin.Meta().Version)
-		if err := core.Backend.RegisterTask(taskId, task); err != nil {
-			return nil, fmt.Errorf("failed to register task %s: %w", taskId, err)
+	for _, plugin := range args.Plugins {
+		if err := core.registerOrUpdatePlugin(plugin); err != nil {
+			return nil, err
 		}
 	}
 
 	return core, nil
+}
+
+func buildTaskID(plugin Plugin) string {
+	return fmt.Sprintf("task-%s-v-%d", plugin.Meta().ID(), plugin.Meta().Version)
+}
+
+func pluginLookupKeys(meta PluginMeta) []string {
+	keys := map[string]struct{}{}
+	add := func(k string) {
+		if k != "" {
+			keys[k] = struct{}{}
+		}
+	}
+	add(meta.Name)
+	add(meta.ID())
+	if meta.Version > 0 {
+		add(fmt.Sprintf("%sv%d", meta.Name, meta.Version)) // lowercase v
+		add(fmt.Sprintf("%sV%d", meta.Name, meta.Version)) // uppercase V
+	}
+
+	out := make([]string, 0, len(keys))
+	for k := range keys {
+		out = append(out, k)
+	}
+	return out
+}
+
+func (core *NexusCore) registerOrUpdatePlugin(plugin Plugin) error {
+	if plugin == nil {
+		return fmt.Errorf("plugin cannot be nil")
+	}
+
+	delegationType := plugin.Meta().Name
+	if delegationType == "" {
+		return fmt.Errorf("plugin delegation type cannot be empty")
+	}
+
+	task, err := createTaskFunction(plugin)
+	if err != nil {
+		return fmt.Errorf("failed to create task for plugin %s: %w", delegationType, err)
+	}
+
+	baseTaskID := buildTaskID(plugin)
+	taskID := baseTaskID
+	existingTaskID, exists := core.taskIDs[delegationType]
+	if exists && existingTaskID == baseTaskID {
+		taskID = fmt.Sprintf("%s-r-%d", baseTaskID, time.Now().UnixNano())
+	}
+
+	if err := core.Backend.RegisterTask(taskID, task); err != nil {
+		return fmt.Errorf("failed to register task %s: %w", taskID, err)
+	}
+
+	if core.Plugins == nil {
+		core.Plugins = make(map[string]Plugin)
+	}
+	if core.pluginSemaphores == nil {
+		core.pluginSemaphores = make(map[string]*semaphore.Weighted)
+	}
+	if core.taskIDs == nil {
+		core.taskIDs = make(map[string]string)
+	}
+
+	core.Plugins[delegationType] = plugin
+	sem := semaphore.NewWeighted(core.maxPluginConcurrentExecution)
+
+	for _, key := range pluginLookupKeys(plugin.Meta()) {
+		core.Plugins[key] = plugin
+		core.pluginSemaphores[key] = sem
+		core.taskIDs[key] = taskID
+	}
+
+	return nil
+}
+
+// RegisterPlugin registers a plugin task in the backend and updates the
+// in-memory plugin registry used during event processing.
+func (core *NexusCore) RegisterPlugin(name string, plugin Plugin) error {
+	if core == nil {
+		return fmt.Errorf("nexus core is nil")
+	}
+
+	if name == "" {
+		return fmt.Errorf("plugin name cannot be empty")
+	}
+
+	if plugin == nil {
+		return fmt.Errorf("plugin cannot be nil")
+	}
+
+	core.mu.Lock()
+	defer core.mu.Unlock()
+
+	return core.registerOrUpdatePlugin(plugin)
 }
 
 // getState retrieves the current status of the orchestrator, including FSM,
@@ -383,11 +483,20 @@ func (core *NexusCore) SubmitEvent(
 	if event.Id.IsZero() {
 		event.Id = primitive.NewObjectID()
 	}
+	if event.MaxAttempts == 0 {
+		event.MaxAttempts = 3
+	}
+
+	event.Attempts = 0
+	if backoffPolicy == nil {
+		backoffPolicy = backoff.NewExponentialBackOff()
+	}
+
 	return backoff.Retry(func() error {
 		event.State = Submitted.String()
 		event.CreatedAt = time.Now()
 		event.UpdatedAt = time.Now()
-		ctx, cancel := context.WithTimeout(core.ctx, 30*time.Second)
+		ctx, cancel := context.WithTimeout(core.ctx, 1*time.Minute)
 		defer cancel()
 		return core.storage.Push(ctx, event)
 	}, backoffPolicy)
@@ -413,11 +522,35 @@ func (nexus *NexusCore) Run(workersCount int) {
 	defer nexus.Logger.Info().Msg("NexusCore server finished")
 
 	nexus.wg.Add(1)
-	worker := nexus.Backend.NewWorker("worker", workersCount)
-	go panicHandler(func() error {
+	go func() {
 		defer nexus.wg.Done()
-		return worker.Launch()
-	})
+		for {
+			select {
+			case <-nexus.ctx.Done():
+				return
+			default:
+			}
+
+			worker := nexus.Backend.NewWorker("worker", workersCount)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						nexus.Logger.Error().Msgf("worker panicked: %v", r)
+					}
+				}()
+				if err := worker.Launch(); err != nil {
+					nexus.Logger.Error().Err(err).Msg("worker launch failed")
+				}
+			}()
+
+			if nexus.ctx.Err() != nil {
+				return
+			}
+
+			nexus.Logger.Warn().Msg("worker exited unexpectedly, restarting")
+			time.Sleep(1 * time.Second)
+		}
+	}()
 
 	go nexus.runStatusLogInfo()
 	go nexus.runErrorWatcher()
@@ -489,7 +622,7 @@ func (nexus *NexusCore) Run(workersCount int) {
 //   - event: The event to requeue.
 //   - state: The new state to set for the event.
 //   - err: The error causing the requeue.
-func (nexus *NexusCore) repushEvent(event EventDetail, state State, err error) error {
+func (core *NexusCore) repushEvent(event EventDetail, state State, err error) error {
 	if err := backoff.Retry(func() error {
 		if err != nil {
 			event.ErrorMessage = err.Error()
@@ -497,24 +630,39 @@ func (nexus *NexusCore) repushEvent(event EventDetail, state State, err error) e
 		event.State = state.String()
 		event.Attempts += 1
 		event.UpdatedAt = time.Now()
-		ctx, cancel := context.WithTimeout(nexus.ctx, 30*time.Second)
+		ctx, cancel := context.WithTimeout(core.ctx, 30*time.Second)
 		defer cancel()
-		return nexus.storage.Push(ctx, event)
+		return core.storage.Push(ctx, event)
 	}, backoff.NewConstantBackOff(1000*time.Millisecond)); err != nil {
-		nexus.Logger.Err(err)
+		core.Logger.Err(err)
 		return err
 	}
 	return nil
 }
 
-func (nexus *NexusCore) runProcessingEventProcessor(workerCount int) {
+func (core *NexusCore) runProcessingEventProcessor(workerCount int) {
 
 	var processor = func(core *NexusCore, event EventDetail) {
 		ctx, cancelFunc := context.WithTimeout(core.ctx, 60*time.Second) // Increased timeout
 		defer cancelFunc()
-		// TODO : check for race condition when testing
-		event.Attempts++
-		if plugin, ok := core.Plugins[event.DelegationType]; !ok {
+
+		core.mu.Lock()
+		plugin, ok := core.Plugins[event.DelegationType]
+		pluginSemaphore := core.pluginSemaphores[event.DelegationType]
+		taskId := core.taskIDs[event.DelegationType]
+		if ok {
+			if pluginSemaphore == nil {
+				pluginSemaphore = semaphore.NewWeighted(core.maxPluginConcurrentExecution)
+				core.pluginSemaphores[event.DelegationType] = pluginSemaphore
+			}
+			if taskId == "" {
+				taskId = buildTaskID(plugin)
+				core.taskIDs[event.DelegationType] = taskId
+			}
+		}
+		core.mu.Unlock()
+
+		if !ok {
 			core.Logger.Warn().Msgf("plugin not found for delegation type '%s'", event.DelegationType)
 			if err := core.repushEvent(event, Retrial, fmt.Errorf("plugin not found: %s", event.DelegationType)); err != nil {
 				core.Logger.Err(err).Msgf("Failed to repush event :%s", event.Id)
@@ -522,7 +670,7 @@ func (nexus *NexusCore) runProcessingEventProcessor(workerCount int) {
 			}
 		} else {
 			start := time.Now()
-			if err := core.pluginSemaphores[event.DelegationType].Acquire(ctx, 1); err != nil {
+			if err := pluginSemaphore.Acquire(ctx, 1); err != nil {
 				core.Logger.Err(err).Msgf("Failed to acquire plugin semaphore for event %s after %v", event.Id, time.Since(start))
 				if err := core.repushEvent(event, Retrial, err); err != nil {
 					core.Logger.Err(err).Msgf("Failed to repush event :%s", event.Id)
@@ -530,9 +678,8 @@ func (nexus *NexusCore) runProcessingEventProcessor(workerCount int) {
 				}
 				return
 			}
-			defer core.pluginSemaphores[event.DelegationType].Release(1) // TODO check how to release weight using defer
+			defer pluginSemaphore.Release(1)
 
-			taskId := fmt.Sprintf("task-%s-v-%d", plugin.Meta().ID(), plugin.Meta().Version)
 			header := tasks.Headers{}
 			header.Set("X-Task-ID", taskId)
 			header.Set("X-Event-ID", event.Id.Hex())
@@ -577,16 +724,16 @@ func (nexus *NexusCore) runProcessingEventProcessor(workerCount int) {
 
 	}
 
-	nexus.wg.Add(workerCount)
+	core.wg.Add(workerCount)
 	for range workerCount {
 		go func() {
-			defer nexus.wg.Done()
+			defer core.wg.Done()
 			for {
 				select {
-				case <-nexus.ctx.Done():
+				case <-core.ctx.Done():
 					return
-				case event := <-nexus.stream.processing:
-					processor(nexus, event)
+				case event := <-core.stream.processing:
+					processor(core, event)
 				}
 			}
 		}()
@@ -598,29 +745,38 @@ func (nexus *NexusCore) runPendingEventProcessor(workerCount int, interval time.
 	var processor = func(core *NexusCore) {
 		ctx, cancelFunc := context.WithTimeout(nexus.ctx, 60*time.Second)
 		defer cancelFunc()
-		if event, err := core.storage.Pull(ctx); err != nil {
-			if err.Error() != "no event present in queue at the moment" {
-				core.Logger.Err(err).Msgf("Pull failed")
-				if len(core.stream.err) < cap(core.stream.err) {
-					core.stream.err <- err
-				} else {
-					core.Logger.Warn().Msgf("Error channel full, skipping error: %v", err)
-				}
+		event, err := core.storage.Pull(ctx)
+
+		if err != nil {
+			// If queue is empty, just return (no error logging needed)
+			if err.Error() == "no event present in queue at the moment" {
 				return
 			}
-			if event != nil {
-				core.Logger.Err(err).Msgf("Pull failed for event : %s", event.Id)
-				if len(core.stream.err) < cap(core.stream.err) {
-					core.stream.err <- core.repushEvent(*event, Pending, err)
-				}
+			// For other errors, log and return
+			core.Logger.Err(err).Msgf("Pull failed")
+			if len(core.stream.err) < cap(core.stream.err) {
+				core.stream.err <- err
+			} else {
+				core.Logger.Warn().Msgf("Error channel full, skipping error: %v", err)
 			}
-		} else {
-			if event != nil {
-				if len(core.stream.processing) < cap(core.stream.processing) {
-					core.stream.processing <- *event
-				} else {
-					core.stream.err <- core.repushEvent(*event, Pending, nil)
-				}
+			return
+		}
+
+		// Successfully pulled an event
+		if event != nil {
+			event.State = Pending.String()
+			event.Queued = false
+			event.UpdatedAt = time.Now()
+			if updateErr := core.storage.UpdateEventResult(ctx, bson.M{"_id": event.Id}, *event); updateErr != nil {
+				core.Logger.Err(updateErr).Msgf("Failed to mark dequeued event as pending for %s", event.Id)
+			}
+
+			if len(core.stream.processing) < cap(core.stream.processing) {
+				core.stream.processing <- *event
+			} else {
+				// Processing channel full, repush event
+				core.Logger.Warn().Msgf("Processing channel full, repushing event: %s", event.Id)
+				core.stream.err <- core.repushEvent(*event, Pending, nil)
 			}
 		}
 	}
@@ -658,57 +814,66 @@ func (nexus *NexusCore) runProcessedTaskCollector(workerCount int, interval time
 			return
 		}
 
-		if task, ok := data.(TaskState); !ok {
+		task, ok := data.(TaskState)
+		if !ok {
 			nexus.Logger.Warn().Msgf("cannot cast task state data: %s", fmt.Sprintf("%T", data))
-			errCh <- err
-		} else {
+			return
+		}
 
-			ctx, cancelFunc = context.WithTimeout(nexus.ctx, 5*time.Second)
-			defer cancelFunc()
-			id, err := primitive.ObjectIDFromHex(task.EventId)
-			if err != nil {
-				if len(nexus.stream.err) < cap(nexus.stream.err) {
-					nexus.stream.err <- err
-					return
-				}
-			}
-
-			results, err := json.Marshal(task.Result)
-			if err != nil {
-				if len(nexus.stream.err) < cap(nexus.stream.err) {
-					nexus.stream.err <- err
-					return
-				}
-			}
-			currentTime := time.Now()
-			err = nexus.storage.UpdateEventResult(
-				ctx, bson.M{"_id": id},
-				EventDetail{
-					State: task.Status, CompletedAt: &currentTime,
-					UpdatedAt: task.UpdatedAt, Result: string(results),
-					Stored: true,
-				})
-			if err != nil {
-				if len(nexus.stream.err) < cap(nexus.stream.err) {
-					nexus.stream.err <- err
-					return
-				}
+		id, err := primitive.ObjectIDFromHex(task.EventId)
+		if err != nil {
+			if len(nexus.stream.err) < cap(nexus.stream.err) {
+				nexus.stream.err <- err
+				return
 			}
 		}
+
+		eventState := task.Status
+		if eventState == "" {
+			eventState = "processed"
+		}
+
+		results, err := json.Marshal(task.Result)
+		if err != nil {
+			nexus.Logger.Err(err).Msgf("failed to marshal task result for event %s", id.Hex())
+			errCh <- err
+			return
+		}
+
+		currentTime := time.Now()
+		ctx, cancelFunc = context.WithTimeout(nexus.ctx, 10*time.Second)
+		defer cancelFunc()
+
+		updateEvent := EventDetail{
+			State:       eventState,
+			CompletedAt: &currentTime,
+			UpdatedAt:   currentTime,
+			Result:      string(results),
+			Stored:      true,
+		}
+
+		if err = nexus.storage.UpdateEventResult(ctx, bson.M{"_id": id}, updateEvent); err != nil {
+			nexus.Logger.Err(err).Msgf("failed to update event result for %s: %v", id.Hex(), err)
+			errCh <- err
+			return
+		}
+		nexus.Logger.Info().Msgf("event status updated [_id=%s] [state=%s]", id.Hex(), eventState)
 	}
 
 	var processor = func(core *NexusCore) {
-		if taskQueue, ok := core.Backend.GetBackend().(*NexusVault); !ok {
-			core.stream.err <- fmt.Errorf("invalid backend type for event queue")
+		vault, ok := core.Backend.GetBackend().(*NexusVault)
+		if !ok {
+			core.Logger.Error().Msg("invalid backend type, expected NexusVault")
 			return
-		} else {
-			ctx, cancelFunc := context.WithTimeout(core.ctx, 5*time.Second)
-			defer cancelFunc()
+		}
 
-			for !taskQueue.Queue.IsEmpty(ctx) {
-				handleTaskUpdate(taskQueue, core.storage.errCh)
-			}
+		ctx, cancelFunc := context.WithTimeout(core.ctx, 30*time.Second)
+		defer cancelFunc()
 
+		processed := 0
+		for !vault.Queue.IsEmpty(ctx) && processed < 10 {
+			handleTaskUpdate(vault, core.stream.err)
+			processed++
 		}
 	}
 
@@ -744,10 +909,6 @@ func (nexus *NexusCore) runStatusLogInfo() {
 		select {
 		case <-nexus.ctx.Done():
 			return
-		case err := <-nexus.storage.errCh:
-			if err != nil {
-				nexus.Logger.Err(err).Msg("error occurred")
-			}
 		case <-ticker.C:
 			status := nexus.getState()
 			if status != lastStatus {
@@ -815,7 +976,7 @@ func createTaskFunction(ops Plugin) (PluginTask, error) {
 	if executeMethodType.NumIn() != 2 {
 		return nil, fmt.Errorf("[Execute] method on plugin %s must have 2 inputs (context.Context, PluginArgs), got %d", ops.Meta().Name, executeMethodType.NumIn())
 	}
-	if executeMethodType.In(0) != reflect.TypeOf((*context.Context)(nil)).Elem() {
+	if executeMethodType.In(0) != reflect.TypeFor[context.Context]() {
 		return nil, fmt.Errorf("[Execute] method on plugin %s must take context.Context as first argument, got %v", ops.Meta().Name, executeMethodType.In(0))
 	}
 	if executeMethodType.NumOut() < 1 || executeMethodType.NumOut() > 2 {
@@ -864,15 +1025,4 @@ func createTaskFunction(ops Plugin) (PluginTask, error) {
 		}
 		return res, err
 	}, nil
-}
-
-func panicHandler(fn func() error) {
-	defer func() {
-		if r := recover(); r != nil {
-			return
-		}
-	}()
-	if err := fn(); err != nil {
-		panic(err)
-	}
 }
