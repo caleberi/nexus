@@ -1,0 +1,21 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Segoe WPC', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #1e1e1e;
+  color: #cccccc;
+}
+
+code {
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+html, body, #root {
+  height: 100%;
+}
