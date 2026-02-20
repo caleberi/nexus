@@ -1,10 +1,11 @@
-# grain
+# nexus
 
-A high-performance, distributed task processing library for Go that provides a plugin-based architecture for building complex data pipelines and workflows.
+`nexus` is a distributed task processing framework for Go, powered by the **NexusCore** engine.
+It supports plugin-based execution, Redis-backed queues, MongoDB persistence, CLI usage, and a web UI for submitting and monitoring events.
 
 ## Overview
 
-`grain` (powered by the NexusCore engine) is a robust task management system that enables you to:
+`nexus` (powered by the NexusCore engine) is a robust task management system that enables you to:
 
 - **Process tasks asynchronously** with configurable worker pools
 - **Build plugin-based workflows** with a simple, extensible interface
@@ -33,16 +34,24 @@ The system consists of three main components:
 ## Installation
 
 ```bash
-go get github.com/caleberi/grain
+go get github.com/caleberi/nexus
 ```
 
 ### Prerequisites
 
-- Go 1.21 or higher
+- Go 1.24.3 or higher
 - Redis 6.0+
 - MongoDB 4.4+
 
 ## Quick Start
+
+### Run the Quickstart Example
+
+The quickstart runs three plugins: image generation, random text generation, and a word-count processor. Output is written to `./generated`.
+
+```bash
+go run ./example/quickstart
+```
 
 ### 1. Define a Plugin
 
@@ -90,8 +99,14 @@ plugins := map[string]nexus.Plugin{
     "my.Plugin": &MyPlugin{},
 }
 
+// Create Redis cache for task queue
+redisCache, err := cache.NewRedis(ctx, cache.RedisConfig{
+    Addr:   "localhost:6379",
+    Logger: logger,
+})
+
 // Create task queue
-taskQueue := NewMockRedisTaskStateQueue(redisClient, "my_queue")
+taskQueue := nexus.NewRedisTaskQueue(redisCache, "my_queue")
 
 // Initialize NexusCore
 core, err := nexus.NewNexusCore(ctx, nexus.NexusCoreBackendArgs{
@@ -124,6 +139,36 @@ event := nexus.EventDetail{
 
 backoffStrategy := backoff.NewExponentialBackOff()
 core.SubmitEvent(event, backoffStrategy)
+```
+
+## CLI
+
+The `nexus` CLI lets you submit events and check queue health.
+
+```bash
+go run ./cmd/nexus --help
+
+# Submit an event
+go run ./cmd/nexus submit \
+    --delegation example.TextGenerator \
+    --payload '{"filename":"sample.txt","words":120,"lineWidth":12}'
+
+# Check health and queue depth
+go run ./cmd/nexus health
+```
+
+## Docker Compose (Dev)
+
+Bring up Redis + MongoDB + Prometheus:
+
+```bash
+docker compose up -d
+```
+
+Run the quickstart in a container:
+
+```bash
+docker compose --profile demo up
 ```
 
 ## Built-in Plugins
@@ -311,8 +356,8 @@ Under MIT License
 ## Support
 
 - 📧 Email: [caleberioluwa@gmail.com]
-- 🐛 Issues: [GitHub Issues](https://github.com/caleberi/my-celery/issues)
-- 📖 Documentation: [Wiki](https://github.com/caleberi/my-celery/wiki)
+- 🐛 Issues: [GitHub Issues](https://github.com/caleberi/grain/issues)
+- 📖 Documentation: [Wiki](https://github.com/caleberi/grain/wiki)
 
 ## Roadmap
 
