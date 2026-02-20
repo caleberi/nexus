@@ -153,11 +153,6 @@ func (nv *NexusVault) pushNewTaskState(
 		return err
 	}
 
-	// if signature != nil {
-	// 	if signature.RetryCount > 0 || signature.RetryTimeout > 0 || !signature.ETA.IsZero() {
-	// 		return nil
-	// 	}
-	// }
 	return nv.Backend.PurgeState(signature.UUID)
 }
 

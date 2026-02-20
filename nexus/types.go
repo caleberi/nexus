@@ -46,8 +46,8 @@ type EventDetail struct {
 	State          string             `json:"state,omitempty" bson:"state,omitempty,omitzero"`
 	Payload        string             `json:"payload,omitempty" bson:"payload,omitempty,omitzero"`
 	Result         string             `json:"result,omitempty" bson:"result,omitempty,omitzero"`
-	Attempts       int                `json:"attempts,omitempty" bson:"attempts,omitzero"`
-	MaxAttempts    int                `json:"max_attempts,omitempty" bson:"max_attempts,omitzero"`
+	Attempts       int                `json:"attempts" bson:"attempts,omitzero"`
+	MaxAttempts    int                `json:"max_attempts" bson:"max_attempts,omitzero"`
 	CreatedAt      time.Time          `json:"created_at,omitzero" bson:"created_at,omitzero"`
 	UpdatedAt      time.Time          `json:"updated_at,omitzero" bson:"updated_at,omitzero"`
 	CompletedAt    *time.Time         `json:"completed_at,omitzero" bson:"completed_at,omitzero"`
