@@ -25,8 +25,8 @@
 // The package requires the following dependencies:
 //   - github.com/redis/go-redis/v9
 //   - go.mongodb.org/mongo-driver/mongo
-//   - quicdrop/internal/logging
-//   - quicdrop/internal/mongod
+//   - github.com/rs/zerolog
+//   - grain/mongod
 //
 // # Usage Example
 //
@@ -44,8 +44,8 @@
 //		"go.mongodb.org/mongo-driver/bson"
 //		"go.mongodb.org/mongo-driver/mongo"
 //		"go.mongodb.org/mongo-driver/mongo/options"
-//		"quicdrop/internal/logging"
-//		"quicdrop/nexus"
+//		"github.com/rs/zerolog"
+//		"grain/nexus"
 //	)
 //
 //	// EventDetail represents the structure of an event in the queue.
@@ -181,7 +181,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"grain/mongod"
 	"strings"
 	"sync"
 	"time"
@@ -207,17 +206,17 @@ type NexusFlowComponentState struct {
 // It implements lease-based concurrency control to ensure events are processed uniquely and
 // supports a dead-letter queue for events exceeding retry limits.
 type NexusFlow struct {
-	ctx                context.Context                 // Context for managing cancellation and timeouts.
-	cancelFunc         context.CancelFunc              // Function to cancel the context.
-	eventQueueKey      string                          // Redis key used for the event queue.
-	client             *redis.Client                   // Redis client for queue operations.
-	logger             zerolog.Logger                  // Logger for tracking operations and errors.
-	leaseTTL           time.Duration                   // Duration for which an event lease is valid.
-	repo               *mongod.Repository[EventDetail] // MongoDB repository for storing event details.
-	maxQueueLength     int                             // Maximum number of events allowed in the Redis queue.
-	operationTimeout   time.Duration                   // Timeout duration for database and Redis operations.
-	clientInfo         mongoClientInfo                 // MongoDB client configuration (replica set or standalone).
-	resolutionInterval time.Duration                   // Interval for scanning and fixing expired leases.
+	ctx                context.Context          // Context for managing cancellation and timeouts.
+	cancelFunc         context.CancelFunc       // Function to cancel the context.
+	eventQueueKey      string                   // Redis key used for the event queue.
+	client             *redis.Client            // Redis client for queue operations.
+	logger             zerolog.Logger           // Logger for tracking operations and errors.
+	leaseTTL           time.Duration            // Duration for which an event lease is valid.
+	repo               *Repository[EventDetail] // MongoDB repository for storing event details.
+	maxQueueLength     int                      // Maximum number of events allowed in the Redis queue.
+	operationTimeout   time.Duration            // Timeout duration for database and Redis operations.
+	clientInfo         mongoClientInfo          // MongoDB client configuration (replica set or standalone).
+	resolutionInterval time.Duration            // Interval for scanning and fixing expired leases.
 	errCh              chan error
 	mu                 sync.RWMutex
 }
@@ -292,9 +291,9 @@ func NewNexusFlow(ctx context.Context, args NexusFlowArgs) (*NexusFlow, error) {
 	database := args.DbClient.Database("nexus-flow-events", options.Database())
 	adminDatabase := args.DbClient.Database("admin", options.Database())
 	collection := database.Collection("events", options.Collection())
-	repo := mongod.NewRepositoryWithOptions(
-		mongod.WithClient[EventDetail](args.DbClient),
-		mongod.WithCollection[EventDetail](collection),
+	repo := NewRepositoryWithOptions(
+		WithClient[EventDetail](args.DbClient),
+		WithCollection[EventDetail](collection),
 	)
 
 	// https://www.mongodb.com/docs/manual/reference/command/replSetGetStatus
@@ -359,7 +358,7 @@ func NewNexusFlow(ctx context.Context, args NexusFlowArgs) (*NexusFlow, error) {
 				if len(events) > 0 {
 					flow.logger.Info().Msgf("Found %d events to re-queue", len(events))
 					for i := range events {
-						if events[i].Attempts >= events[i].MaxAttempts {
+						if events[i].MaxAttempts > 0 && events[i].Attempts >= events[i].MaxAttempts {
 							events[i].Dead = true
 							events[i].Queued = false
 						}
@@ -496,8 +495,11 @@ func (flow *NexusFlow) Push(ctx context.Context, event EventDetail) error {
 		return fmt.Errorf("max attempts cannot be negative (attempts: %d)", event.MaxAttempts)
 	}
 
-	if event.Attempts >= event.MaxAttempts {
+	// Mark event as dead only if MaxAttempts is set (> 0) and exceeded
+	// MaxAttempts = 0 means unlimited retries
+	if event.MaxAttempts > 0 && event.Attempts >= event.MaxAttempts {
 		event.Dead = true
+		event.Queued = false
 	}
 
 	if event.Id.IsZero() {
@@ -511,68 +513,70 @@ func (flow *NexusFlow) Push(ctx context.Context, event EventDetail) error {
 	if !isReplicaSet {
 		// Check if the event exists in MongoDB
 		filter := bson.D{{Key: "_id", Value: event.Id}}
-		err := flow.checkEventInDatabase(ctx, filter)
 		event.Stored = true
-		// If the event doesn't exist, create it
-		if errors.Is(err, mongo.ErrNoDocuments) {
-			ctx, cancel := context.WithTimeout(flow.ctx, flow.operationTimeout)
-			defer cancel()
+		exists, err := flow.eventExistsInDatabase(ctx, filter)
+		if err != nil {
+			return fmt.Errorf("failed to check existing event: %w", err)
+		}
+		if !exists {
 			err = flow.logEventInDatabase(ctx, event)
 			if err != nil {
 				return fmt.Errorf("failed to log event in database: %w", err)
 			}
 		} else {
-			// If the event exists, update it
-			ctx, cancel := context.WithTimeout(flow.ctx, flow.operationTimeout)
-			defer cancel()
 			err = flow.updateEventLogInDatabase(ctx, event)
-			if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+			if err != nil {
 				return fmt.Errorf("failed to update event in database: %w", err)
 			}
 		}
 
 		// Queue the event in Redis if not dead
 		if !event.Dead {
-			ctx, cancel := context.WithTimeout(flow.ctx, flow.operationTimeout)
-			defer cancel()
 			if err := flow.queue(ctx, event); err != nil {
 				return fmt.Errorf("failed to queue event: %w", err)
 			}
 			event.Queued = true
 			// Update the event in MongoDB to reflect Queued status
-			ctx, cancel = context.WithTimeout(flow.ctx, flow.operationTimeout)
-			defer cancel()
-			err = flow.updateEventLogInDatabase(ctx, event)
-			if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+			err := flow.updateEventLogInDatabase(ctx, event)
+			if err != nil {
 				return fmt.Errorf("failed to update event in database: %w", err)
+			}
+		} else {
+			// Dead event should not be queued - update DB to reflect this
+			event.Queued = false
+			err := flow.updateEventLogInDatabase(ctx, event)
+			if err != nil {
+				return fmt.Errorf("failed to update dead event in database: %w", err)
 			}
 		}
 		return nil
 	}
 
-	// Replica set case
-	if err := flow.checkReplicaSetStatus(ctx); err != nil {
+	opCtx, cancel := context.WithTimeout(ctx, flow.operationTimeout)
+	err := flow.checkReplicaSetStatus(opCtx)
+	cancel()
+	if err != nil {
 		return fmt.Errorf("replica set not ready for transaction (event=%v): %w", event, err)
 	}
 
 	return flow.repo.WrapWithTransaction(
 		ctx, event, func(
 			ctx mongo.SessionContext,
-			repo *mongod.Repository[EventDetail], data EventDetail) error {
+			repo *Repository[EventDetail], data EventDetail) error {
 			filter := bson.D{{Key: "_id", Value: data.Id}}
-			err := flow.checkEventInDatabase(ctx, filter)
-			if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+			exists, err := flow.eventExistsInDatabase(ctx, filter)
+			if err != nil {
 				return fmt.Errorf("failed to check existing event: %w", err)
 			}
 			data.Stored = true
-			if errors.Is(err, mongo.ErrNoDocuments) {
+			if !exists {
 				err = flow.logEventInDatabase(ctx, data)
 				if err != nil {
 					return fmt.Errorf("failed to log event in database: %w", err)
 				}
 			} else {
 				err = flow.updateEventLogInDatabase(ctx, data)
-				if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+				if err != nil {
 					return fmt.Errorf("failed to update event in database: %w", err)
 				}
 			}
@@ -583,8 +587,15 @@ func (flow *NexusFlow) Push(ctx context.Context, event EventDetail) error {
 				}
 				data.Queued = true
 				err = flow.updateEventLogInDatabase(ctx, data)
-				if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+				if err != nil {
 					return fmt.Errorf("failed to update event in database: %w", err)
+				}
+			} else {
+				// Dead event should not be queued
+				data.Queued = false
+				err = flow.updateEventLogInDatabase(ctx, data)
+				if err != nil {
+					return fmt.Errorf("failed to update dead event in database: %w", err)
 				}
 			}
 			return nil
@@ -592,20 +603,21 @@ func (flow *NexusFlow) Push(ctx context.Context, event EventDetail) error {
 		options.Session().SetDefaultWriteConcern(writeconcern.Majority()))
 }
 
-func (flow *NexusFlow) checkEventInDatabase(ctx context.Context, filter bson.D) error {
-	flow.mu.RLock()
-	defer flow.mu.RUnlock()
-	_, err := flow.repo.FindOne(ctx, filter)
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		return fmt.Errorf("failed to check existing event: %w", err)
+func (flow *NexusFlow) eventExistsInDatabase(ctx context.Context, filter bson.D) (bool, error) {
+
+	opCtx, cancel := context.WithTimeout(ctx, flow.operationTimeout)
+	defer cancel()
+	count, err := flow.repo.Count(opCtx, filter)
+	if err != nil {
+		return false, fmt.Errorf("failed to check existing event: %w, for %v", err, filter)
 	}
-	return err
+	return count > 0, nil
 }
 
 func (flow *NexusFlow) logEventInDatabase(ctx context.Context, event EventDetail) error {
-	flow.mu.Lock()
-	defer flow.mu.Unlock()
-	_, err := flow.repo.Create(ctx, event)
+	opCtx, cancel := context.WithTimeout(ctx, flow.operationTimeout)
+	defer cancel()
+	_, err := flow.repo.Create(opCtx, event)
 	if err != nil {
 		return err
 	}
@@ -614,24 +626,46 @@ func (flow *NexusFlow) logEventInDatabase(ctx context.Context, event EventDetail
 
 func (flow *NexusFlow) updateEventLogInDatabase(ctx context.Context, event EventDetail) error {
 	currentVersion := event.Version
-	event.Version += 1
+	next := event
+	next.Version = currentVersion + 1
 
-	filter := bson.D{
-		{Key: "_id", Value: event.Id},
-		{Key: "version", Value: currentVersion},
+	opCtx, cancel := context.WithTimeout(ctx, flow.operationTimeout)
+	defer cancel()
+
+	_, err := flow.repo.UpdateOneByFilter(
+		opCtx,
+		bson.M{"_id": event.Id, "version": currentVersion},
+		next,
+		options.FindOneAndUpdate().SetUpsert(false).SetReturnDocument(options.After),
+	)
+	if err == nil {
+		return nil
 	}
 
-	err := flow.checkEventInDatabase(ctx, filter)
-	if err != nil || errors.Is(err, mongo.ErrNoDocuments) {
-		return fmt.Errorf("failed to check existing event: %w", err)
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		return fmt.Errorf("failed to update event in database: %w", err)
 	}
 
-	flow.mu.Lock()
-	defer flow.mu.Unlock()
-	return flow.repo.UpdateOneById(
-		ctx, event.Id, event,
-		options.FindOneAndUpdate().
-			SetUpsert(true).SetReturnDocument(options.After))
+	latest, findErr := flow.repo.FindOneById(opCtx, event.Id)
+	if findErr != nil {
+		return fmt.Errorf("failed to update event in database: no matching version for event %s", event.Id.Hex())
+	}
+
+	next.Version = latest.Version + 1
+	_, retryErr := flow.repo.UpdateOneByFilter(
+		opCtx,
+		bson.M{"_id": event.Id, "version": latest.Version},
+		next,
+		options.FindOneAndUpdate().SetUpsert(false).SetReturnDocument(options.After),
+	)
+	if retryErr != nil {
+		if errors.Is(retryErr, mongo.ErrNoDocuments) {
+			return fmt.Errorf("failed to update event in database: stale version for event %s", event.Id.Hex())
+		}
+		return fmt.Errorf("failed to update event in database: %w", retryErr)
+	}
+
+	return nil
 }
 
 // Pull retrieves and removes an event from the Redis queue, setting a lease to prevent concurrent processing.
@@ -983,23 +1017,24 @@ func (flow *NexusFlow) checkReplicaSetStatus(ctx context.Context) error {
 	return nil
 }
 
-// // GetRepo returns the MongoDB repository used for storing event details.
-// // Returns:
-// //   - A pointer to the MongoDB repository for EventDetail.
-// func (flow *NexusFlow) GetRepo() *mongod.Repository[EventDetail] { return flow.repo }
+// GetRepo returns the MongoDB repository used for storing event details.
+// Returns:
+//   - A pointer to the MongoDB repository for EventDetail.
+func (flow *NexusFlow) GetRepo() *Repository[EventDetail] { return flow.repo }
 
 func (flow *NexusFlow) ReadErrorStream() <-chan error { return flow.errCh }
 
 func (flow *NexusFlow) ReconcileEvent(
 	ctx context.Context, filter bson.M,
-	event EventDetail, reconcilationSpec mongod.ReconcilationSpec) (*EventDetail, bool, error) {
+	event EventDetail, reconcilationSpec ReconcilationSpec) (*EventDetail, bool, error) {
 	return flow.repo.Reconcile(ctx, event, filter, reconcilationSpec)
 }
 
 func (flow *NexusFlow) UpdateEventResult(ctx context.Context, filter bson.M, event EventDetail) error {
 	// TODO: Figure out how to update without deleting every information
 	_, err := flow.repo.UpdateOneByFilter(
-		ctx, filter, event, options.FindOneAndUpdate().SetReturnDocument(options.After).SetUpsert(true))
+		ctx, filter, event,
+		options.FindOneAndUpdate().SetReturnDocument(options.After).SetUpsert(true))
 	if err == nil || errors.Is(err, mongo.ErrNoDocuments) {
 		return nil
 	}
