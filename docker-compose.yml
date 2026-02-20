@@ -1,0 +1,84 @@
+services:
+  redis:
+    image: redis:7.2
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mongodb:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  # demo:
+  #   image: golang:1.26.0-trixie
+  #   working_dir: /workspace
+  #   volumes:
+  #     - ./:/workspace
+  #   command: ["go", "run", "./example/quickstart"]
+  #   environment:
+  #     - NEXUS_REDIS_ADDR=redis:6379
+  #     - NEXUS_MONGO_URI=mongodb://mongodb:27017
+  #     - CLOUDINARY_CLOUD_NAME=XXXXXX
+  #     - CLOUDINARY_API_KEY=XXXXXX
+  #     - CLOUDINARY_API_SECRET=XXXXXX
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #     mongodb:
+  #       condition: service_healthy
+    
+  web:
+    image: golang:1.26.0-trixie
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    command: ["go", "run", "./cmd/web"]
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXUS_WEB_PORT=3000
+      - NEXUS_REDIS_ADDR=redis:6379
+      - NEXUS_MONGO_URI=mongodb://mongodb:27017
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /workspace/cmd/web/frontend
+    environment:
+      - VITE_API_PROXY_TARGET=http://web:3000
+    volumes:
+      - ./:/workspace
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+    ports:
+      - "5173:5173"
+    depends_on:
+      - web
+
+volumes:
+  redis_data:
+  mongo_data:
