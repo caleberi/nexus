@@ -1,7 +1,11 @@
-# nexus
+# Nexus
 
-`nexus` is a distributed task processing framework for Go, powered by the **NexusCore** engine.
+`Nexus` is a distributed task processing framework for Go, powered by the **NexusCore** engine.
 It supports plugin-based execution, Redis-backed queues, MongoDB persistence, CLI usage, and a web UI for submitting and monitoring events.
+
+
+https://github.com/user-attachments/assets/b2a0ade6-ba49-4939-93a1-d1c1e0f6092e
+
 
 ## Overview
 
